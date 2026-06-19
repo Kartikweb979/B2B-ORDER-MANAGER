@@ -1,3 +1,4 @@
 .env 
 orders.db
 __pycache__/
+orders.jsonl
