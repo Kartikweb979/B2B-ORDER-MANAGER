@@ -1,13 +1,17 @@
 import asyncio
+import csv
 import json
-from dotenv import load_dotenv 
-load_dotenv()
 import os
+import tempfile
+from dotenv import load_dotenv
+load_dotenv()
 import sqlite3
 from datetime import datetime, timezone
 
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from order_parser import format_parse_error, parse_order
 
@@ -93,6 +97,33 @@ def fetch_all_orders() -> list[dict]:
         return [dict(row) for row in cursor.fetchall()]
 
 
+_EXPORT_COLUMNS = (
+    "id", "ParsedAt", "TelegramUser", "TelegramUsername", "RawMessage",
+    "ClientName", "ProductType", "Quantity", "PlyType", "Material", "DeliveryDate",
+)
+
+
+def fetch_all_orders_for_export() -> list[dict]:
+    """Return every Orders column for CSV export, oldest first."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        columns = ", ".join(_EXPORT_COLUMNS)
+        cursor = conn.execute(f"""
+            SELECT {columns}
+            FROM Orders
+            ORDER BY id ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def write_orders_csv(orders: list[dict], path: str) -> None:
+    """Write orders to a CSV file at `path` (UTF-8 with BOM for Excel)."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_EXPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(orders)
+
+
 def _clean_field(value: str | None) -> str | None:
     if value is None:
         return None
@@ -166,13 +197,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Send a WhatsApp-style order message and I will parse it into JSON.\n\n"
         "Commands:\n"
-        "hisaab — view all saved orders\n\n"
+        "hisaab — view all saved orders\n"
+        "export — download all orders as a CSV file\n\n"
         "Example:\n"
         "Bhaiya 2000 pizza boxes bhej do brown kraft paper mein 3-ply, kal tak"
     )
 
 
-async def hisaab (update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        orders = await asyncio.to_thread(fetch_all_orders_for_export)
+    except sqlite3.Error as e:
+        print(f"[DB ERROR] Failed to export orders: {e}")
+        await update.message.reply_text(
+            "Could not read orders from the database. Please try again later."
+        )
+        return
+
+    if not orders:
+        await update.message.reply_text("No orders found to export.")
+        return
+
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        await asyncio.to_thread(write_orders_csv, orders, tmp_path)
+        with open(tmp_path, "rb") as doc:
+            await update.message.reply_document(
+                document=doc,
+                filename="orders_report.csv",
+                caption=f"Exported {len(orders)} order(s).",
+            )
+    except OSError as e:
+        print(f"[EXPORT ERROR] Failed to create CSV: {e}")
+        await update.message.reply_text(
+            "Could not generate the export file. Please try again later."
+        )
+    except Exception as e:
+        print(f"[EXPORT ERROR] Failed to send document: {e}")
+        await update.message.reply_text(
+            "Could not send the export file. Please try again later."
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError as e:
+                print(f"[EXPORT ERROR] Failed to remove temp file: {e}")
+
+
+async def hisaab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         orders = await asyncio.to_thread(fetch_all_orders)
     except sqlite3.Error as e:
@@ -209,6 +284,17 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, (TimedOut, NetworkError)):
+        print(f"[NETWORK] {context.error} — will retry automatically")
+        return
+    print(f"[ERROR] {context.error}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -221,12 +307,15 @@ def main() -> None:
 
     init_db()   # <-- creates Orders table on first run
 
-    app = Application.builder().token(TOKEN).build()
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
+    app = Application.builder().token(TOKEN).request(request).build()
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("hisaab", hisaab))
+    app.add_handler(CommandHandler("export", export_orders))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order))
     print("Bot running. Forward order messages here — they will be parsed automatically.")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
