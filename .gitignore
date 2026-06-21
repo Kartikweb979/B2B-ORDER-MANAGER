@@ -2,3 +2,4 @@
 orders.db
 __pycache__/
 orders.jsonl
+bot.log

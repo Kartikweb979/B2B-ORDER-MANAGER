@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import json
+import logging
 import os
 import tempfile
 from dotenv import load_dotenv
@@ -18,6 +19,93 @@ from order_parser import format_parse_error, parse_order
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ORDERS_LOG = os.environ.get("ORDERS_LOG", "orders.jsonl")
 DB_PATH = os.environ.get("ORDERS_DB", "orders.db")
+LOG_FILE = os.environ.get("BOT_LOG", "bot.log")
+LOG_VERBOSE = os.environ.get("BOT_LOG_VERBOSE", "").lower() in ("1", "true", "yes")
+
+logger = logging.getLogger("telegram_bot")
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Strip API tokens and keys from log records."""
+
+    _secrets: list[str] = []
+
+    @classmethod
+    def register(cls, *values: str | None) -> None:
+        for value in values:
+            if value and value not in cls._secrets:
+                cls._secrets.append(value)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        for secret in self._secrets:
+            if secret in msg:
+                msg = msg.replace(secret, "***REDACTED***")
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+class CompactFormatter(logging.Formatter):
+    """Single-line exception summaries unless BOT_LOG_VERBOSE is enabled."""
+
+    def formatException(self, ei) -> str:
+        if LOG_VERBOSE:
+            return super().formatException(ei)
+        exc_type, exc_value, _ = ei
+        return f"{exc_type.__name__}: {exc_value}"
+
+
+def log_error(message: str, exc: BaseException | None = None) -> None:
+    """Log a failure as one clean line (full traceback only when BOT_LOG_VERBOSE=1)."""
+    if exc is None:
+        logger.error(message)
+    elif LOG_VERBOSE:
+        logger.error("%s", message, exc_info=exc)
+    else:
+        logger.error("%s | %s: %s", message, type(exc).__name__, exc)
+
+
+def setup_logging() -> None:
+    """Configure file + console logging (idempotent)."""
+    if logger.handlers:
+        return
+
+    RedactSecretsFilter.register(TOKEN, os.environ.get("GEMINI_API_KEY"))
+
+    logger.setLevel(logging.DEBUG)
+
+    formatter = CompactFormatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    redact = RedactSecretsFilter()
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    file_handler.addFilter(redact)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(redact)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+def _log_incoming(update: Update, kind: str) -> None:
+    """Log every incoming Telegram message or command."""
+    user = update.effective_user
+    text = update.message.text if update.message else None
+    logger.info(
+        "Incoming %s | user=%s (@%s) | %r",
+        kind,
+        user.id if user else "unknown",
+        user.username or "-",
+        text,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +132,10 @@ def init_db() -> None:
                 )
             """)
             conn.commit()
-        print(f"Database ready: {DB_PATH}")
-    except sqlite3.Error as e:
-        raise SystemExit(f"Failed to initialise database: {e}") from e
+        logger.info("Database ready: %s", DB_PATH)
+    except sqlite3.Error as exc:
+        log_error(f"Failed to initialise database at {DB_PATH}", exc)
+        raise SystemExit(f"Failed to initialise database — see {LOG_FILE}") from None
 
 
 def insert_order(order: dict, update: Update) -> None:
@@ -80,9 +169,16 @@ def insert_order(order: dict, update: Update) -> None:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(sql, record)
             conn.commit()
-    except sqlite3.Error as e:
-        # Log but don't crash the bot — order is still returned to the user
-        print(f"[DB ERROR] Failed to insert order: {e}")
+        logger.info(
+            "Order inserted | client=%s | product=%s | user=%s",
+            record["client_name"],
+            record["product_type"],
+            record["telegram_user"],
+        )
+    except sqlite3.OperationalError as exc:
+        log_error(f"SQLite lock while inserting order for {record['telegram_user']}", exc)
+    except sqlite3.Error as exc:
+        log_error(f"Database error while inserting order for {record['telegram_user']}", exc)
 
 
 def fetch_all_orders() -> list[dict]:
@@ -194,6 +290,7 @@ def _save_order_jsonl(order: dict, update: Update) -> None:
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _log_incoming(update, "command:/start")
     await update.message.reply_text(
         "Send a WhatsApp-style order message and I will parse it into JSON.\n\n"
         "Commands:\n"
@@ -205,10 +302,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _log_incoming(update, "command:/export")
     try:
         orders = await asyncio.to_thread(fetch_all_orders_for_export)
-    except sqlite3.Error as e:
-        print(f"[DB ERROR] Failed to export orders: {e}")
+    except sqlite3.Error as exc:
+        log_error("Failed to export orders from database", exc)
         await update.message.reply_text(
             "Could not read orders from the database. Please try again later."
         )
@@ -229,13 +327,13 @@ async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 filename="orders_report.csv",
                 caption=f"Exported {len(orders)} order(s).",
             )
-    except OSError as e:
-        print(f"[EXPORT ERROR] Failed to create CSV: {e}")
+    except OSError as exc:
+        log_error("Failed to create CSV export file", exc)
         await update.message.reply_text(
             "Could not generate the export file. Please try again later."
         )
-    except Exception as e:
-        print(f"[EXPORT ERROR] Failed to send document: {e}")
+    except Exception as exc:
+        log_error("Failed to send export document", exc)
         await update.message.reply_text(
             "Could not send the export file. Please try again later."
         )
@@ -243,15 +341,16 @@ async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except OSError as e:
-                print(f"[EXPORT ERROR] Failed to remove temp file: {e}")
+            except OSError as exc:
+                log_error(f"Failed to remove temp export file {tmp_path}", exc)
 
 
 async def hisaab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _log_incoming(update, "command:/hisaab")
     try:
         orders = await asyncio.to_thread(fetch_all_orders)
-    except sqlite3.Error as e:
-        print(f"[DB ERROR] Failed to read orders: {e}")
+    except sqlite3.Error as exc:
+        log_error("Failed to read orders for hisaab report", exc)
         await update.message.reply_text(
             "Could not read orders from the database. Please try again later."
         )
@@ -267,12 +366,19 @@ async def hisaab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _log_incoming(update, "order")
     text = update.message.text
     await update.message.reply_text("Parsing order...")
 
     try:
         order = await asyncio.to_thread(parse_order, text)
     except Exception as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            log_error("Invalid JSON while parsing order", exc)
+        elif isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower() or "timeout" in str(exc).lower():
+            log_error("Gemini API timeout while parsing order", exc)
+        else:
+            log_error("Failed to parse order", exc)
         await update.message.reply_text(format_parse_error(exc))
         return
 
@@ -289,9 +395,9 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, (TimedOut, NetworkError)):
-        print(f"[NETWORK] {context.error} — will retry automatically")
+        logger.warning("Telegram network error (will retry) | %s", context.error)
         return
-    print(f"[ERROR] {context.error}")
+    log_error("Unhandled bot error", context.error)
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +405,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    setup_logging()
+
     if not TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN environment variable is not set")
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
 
     if not os.environ.get("GEMINI_API_KEY"):
+        logger.critical("GEMINI_API_KEY environment variable is not set")
         raise SystemExit("Set GEMINI_API_KEY environment variable.")
 
     init_db()   # <-- creates Orders table on first run
@@ -314,8 +424,14 @@ def main() -> None:
     app.add_handler(CommandHandler("hisaab", hisaab))
     app.add_handler(CommandHandler("export", export_orders))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order))
-    print("Bot running. Forward order messages here — they will be parsed automatically.")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Bot started — logging to %s", LOG_FILE)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        log_error("Bot stopped due to a fatal error", exc)
+        raise
 
 
 if __name__ == "__main__":
