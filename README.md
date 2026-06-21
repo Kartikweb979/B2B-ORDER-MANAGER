@@ -1,4 +1,4 @@
-                                                 { B2B Order Manager: AI-Powered Parsing & Decoupled Architecture }
+ [ B2B Order Manager: AI-Powered Parsing & Decoupled Architecture ]
 
 [ The Problem  ]
 Managing wholesale B2B orders via messaging apps like WhatsApp or Telegram is inherently chaotic. Clients send unstructured, typo-ridden text messages, making it difficult to maintain accounts, track inventory, and generate reports without massive manual data entry overhead. 
@@ -47,7 +47,7 @@ Tech Stack
 
 1. Environment Variables
 Copy the example environment file and add your actual credentials:
-[   cp .env.example .env   ]
+    cp .env.example .env   
 Note: Your .env should include GEMINI_API_KEY and TELEGRAM_BOT_TOKEN.
 2. Start the Backend API
 Install dependencies and run the FastAPI server:
