@@ -7,19 +7,20 @@ import tempfile
 from dotenv import load_dotenv
 load_dotenv()
 import sqlite3
-from datetime import datetime, timezone
+
+import requests
+from requests.exceptions import HTTPError, RequestException
 
 from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from order_parser import format_parse_error, parse_order
-
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ORDERS_LOG = os.environ.get("ORDERS_LOG", "orders.jsonl")
 DB_PATH = os.environ.get("ORDERS_DB", "orders.db")
 LOG_FILE = os.environ.get("BOT_LOG", "bot.log")
+API_URL = os.environ.get("ORDER_API_URL", "http://127.0.0.1:8000/process-order")
+API_TIMEOUT = float(os.environ.get("ORDER_API_TIMEOUT", "120"))
 LOG_VERBOSE = os.environ.get("BOT_LOG_VERBOSE", "").lower() in ("1", "true", "yes")
 
 logger = logging.getLogger("telegram_bot")
@@ -71,7 +72,7 @@ def setup_logging() -> None:
     if logger.handlers:
         return
 
-    RedactSecretsFilter.register(TOKEN, os.environ.get("GEMINI_API_KEY"))
+    RedactSecretsFilter.register(TOKEN)
 
     logger.setLevel(logging.DEBUG)
 
@@ -132,53 +133,8 @@ def init_db() -> None:
                 )
             """)
             conn.commit()
-        logger.info("Database ready: %s", DB_PATH)
     except sqlite3.Error as exc:
-        log_error(f"Failed to initialise database at {DB_PATH}", exc)
-        raise SystemExit(f"Failed to initialise database — see {LOG_FILE}") from None
-
-
-def insert_order(order: dict, update: Update) -> None:
-    """Persist a parsed order to the SQLite Orders table."""
-    user = update.effective_user
-    raw_message = update.message.text if update.message else ""
-
-    record = {
-        "parsed_at":          datetime.now(timezone.utc).isoformat(),
-        "telegram_user":      user.full_name if user else "Unknown",
-        "telegram_username":  user.username  if user else None,
-        "raw_message":        raw_message,
-        "client_name":        order.get("ClientName"),
-        "product_type":       order.get("ProductType"),
-        "quantity":           str(order.get("Quantity", "")) if order.get("Quantity") is not None else None,
-        "ply_type":           order.get("PlyType"),
-        "material":           order.get("Material"),
-        "delivery_date":      order.get("DeliveryDate"),
-    }
-
-    sql = """
-        INSERT INTO Orders
-            (ParsedAt, TelegramUser, TelegramUsername, RawMessage,
-             ClientName, ProductType, Quantity, PlyType, Material, DeliveryDate)
-        VALUES
-            (:parsed_at, :telegram_user, :telegram_username, :raw_message,
-             :client_name, :product_type, :quantity, :ply_type, :material, :delivery_date)
-    """
-
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(sql, record)
-            conn.commit()
-        logger.info(
-            "Order inserted | client=%s | product=%s | user=%s",
-            record["client_name"],
-            record["product_type"],
-            record["telegram_user"],
-        )
-    except sqlite3.OperationalError as exc:
-        log_error(f"SQLite lock while inserting order for {record['telegram_user']}", exc)
-    except sqlite3.Error as exc:
-        log_error(f"Database error while inserting order for {record['telegram_user']}", exc)
+        raise SystemExit(f"Failed to initialise database: {exc}") from exc
 
 
 def fetch_all_orders() -> list[dict]:
@@ -269,20 +225,57 @@ def _split_message(text: str, max_len: int = 4000) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Legacy JSONL helper (kept so existing logs aren't broken)
+# Order API client
 # ---------------------------------------------------------------------------
 
-def _save_order_jsonl(order: dict, update: Update) -> None:
+def _process_order_via_api(text: str, update: Update) -> dict:
+    """POST the raw message to the FastAPI order-processing service."""
     user = update.effective_user
-    record = {
-        "parsed_at":          datetime.now(timezone.utc).isoformat(),
-        "telegram_user":      user.full_name if user else "Unknown",
-        "telegram_username":  user.username  if user else None,
-        "raw_message":        update.message.text if update.message else "",
-        **order,
+    payload = {
+        "text": text,
+        "source_user": user.full_name if user else None,
+        "source_username": user.username if user else None,
     }
-    with open(ORDERS_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    logger.info(
+        "POST %s | user=%s (@%s)",
+        API_URL,
+        user.id if user else "unknown",
+        user.username or "-",
+    )
+    response = requests.post(API_URL, json=payload, timeout=API_TIMEOUT)
+    logger.info("API response | status=%s", response.status_code)
+    response.raise_for_status()
+    return response.json()
+
+
+def _api_error_detail(exc: HTTPError) -> str:
+    if exc.response is None:
+        return "Order processing failed."
+    try:
+        body = exc.response.json()
+        detail = body.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, list):
+            return "; ".join(str(item) for item in detail)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return "Order processing failed."
+
+
+def _format_order_confirmation(data: dict) -> str:
+    order = data.get("order", {})
+    lines = [
+        f"Order saved successfully (ID: {data.get('order_id')})",
+        "",
+        f"Client: {order.get('ClientName', 'Not Provided')}",
+        f"Product: {order.get('ProductType', 'Not Provided')}",
+        f"Quantity: {order.get('Quantity', 'Not Provided')}",
+        f"Ply: {order.get('PlyType', 'Not Provided')}",
+        f"Material: {order.get('Material', 'Not Provided')}",
+        f"Delivery: {order.get('DeliveryDate', 'Not Provided')}",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +298,7 @@ async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     _log_incoming(update, "command:/export")
     try:
         orders = await asyncio.to_thread(fetch_all_orders_for_export)
-    except sqlite3.Error as exc:
-        log_error("Failed to export orders from database", exc)
+    except sqlite3.Error:
         await update.message.reply_text(
             "Could not read orders from the database. Please try again later."
         )
@@ -327,13 +319,11 @@ async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 filename="orders_report.csv",
                 caption=f"Exported {len(orders)} order(s).",
             )
-    except OSError as exc:
-        log_error("Failed to create CSV export file", exc)
+    except OSError:
         await update.message.reply_text(
             "Could not generate the export file. Please try again later."
         )
-    except Exception as exc:
-        log_error("Failed to send export document", exc)
+    except Exception:
         await update.message.reply_text(
             "Could not send the export file. Please try again later."
         )
@@ -341,16 +331,15 @@ async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except OSError as exc:
-                log_error(f"Failed to remove temp export file {tmp_path}", exc)
+            except OSError:
+                pass
 
 
 async def hisaab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _log_incoming(update, "command:/hisaab")
     try:
         orders = await asyncio.to_thread(fetch_all_orders)
-    except sqlite3.Error as exc:
-        log_error("Failed to read orders for hisaab report", exc)
+    except sqlite3.Error:
         await update.message.reply_text(
             "Could not read orders from the database. Please try again later."
         )
@@ -368,25 +357,26 @@ async def hisaab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _log_incoming(update, "order")
     text = update.message.text
-    await update.message.reply_text("Parsing order...")
+    await update.message.reply_text("Processing your order...")
 
     try:
-        order = await asyncio.to_thread(parse_order, text)
-    except Exception as exc:
-        if isinstance(exc, json.JSONDecodeError):
-            log_error("Invalid JSON while parsing order", exc)
-        elif isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower() or "timeout" in str(exc).lower():
-            log_error("Gemini API timeout while parsing order", exc)
-        else:
-            log_error("Failed to parse order", exc)
-        await update.message.reply_text(format_parse_error(exc))
+        result = await asyncio.to_thread(_process_order_via_api, text, update)
+    except HTTPError as exc:
+        await update.message.reply_text(_api_error_detail(exc))
+        return
+    except RequestException as exc:
+        log_error("FastAPI server unreachable", exc)
+        await update.message.reply_text(
+            "Could not reach the order processing service. "
+            "Make sure the API is running at http://127.0.0.1:8000."
+        )
         return
 
-    # Persist to both SQLite and the legacy JSONL log
-    await asyncio.to_thread(insert_order, order, update)
-    await asyncio.to_thread(_save_order_jsonl, order, update)
+    if not result.get("success"):
+        await update.message.reply_text("Order processing failed. Please try again.")
+        return
 
-    await update.message.reply_text(json.dumps(order, ensure_ascii=False, indent=2))
+    await update.message.reply_text(_format_order_confirmation(result))
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +401,7 @@ def main() -> None:
         logger.critical("TELEGRAM_BOT_TOKEN environment variable is not set")
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        logger.critical("GEMINI_API_KEY environment variable is not set")
-        raise SystemExit("Set GEMINI_API_KEY environment variable.")
-
-    init_db()   # <-- creates Orders table on first run
+    init_db()   # ensures DB exists for hisaab/export reads
 
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = Application.builder().token(TOKEN).request(request).build()
