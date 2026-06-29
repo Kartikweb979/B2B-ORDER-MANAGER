@@ -29,6 +29,8 @@ Initially built as a monolith, I refactored the system into a decoupled microser
                         │    Google GenAI   │     │ SQLite Database   │     │ Distributed       │
                         │    (NLP Engine)   │     │ (Persistence)     │     │ Logging (bot.log) │
                         └───────────────────┘     └───────────────────┘     └───────────────────┘
+
+```
 Challenges, Trade-offs & What I Learned
 The LLM Reliability Problem: AI models are non-deterministic. Initially, Gemini would occasionally return invalid JSON or timeout. Trade-off/Fix: Instead of trusting the output blindly, I implemented prompt guardrails, strict JSON parsing validation, and a retry mechanism.
 The Observability Gap: When I decoupled the system into two services, debugging became difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
