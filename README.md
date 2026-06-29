@@ -67,4 +67,5 @@ python telegram_bot.py
 
 ## Testing (The Safety Net)
 Run the test suite to verify data parsing, API mocking, and the /health endpoint:
-pytest __tests__/
+
+- pytest __tests__/ 
