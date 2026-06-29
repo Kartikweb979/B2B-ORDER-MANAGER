@@ -41,7 +41,8 @@ Production Monitoring: Decoupling the system created a visibility gap; if the AP
 
 -  Distributed Observability: Tracking errors across two microservices was difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
 
-##Tech Stack 
+## Tech Stack 
+
 Backend: Python 3.12, FastAPI, Uvicorn
 
 Client: python-telegram-bot, Requests, Asyncio (for background monitoring)
