@@ -8,11 +8,11 @@ I built a decoupled, AI-native system to automate the extraction of structured d
 
 ## Impact & Business Value
 - **Efficiency:** Automated order parsing, reducing manual data entry time by ~80% and practically eliminating human transcription errors.
-- **Reporting:** Built a `/export` pipeline that dynamically queries the database and generates business-ready CSV reports on demand.
+- **Proactive Uptime:** Engineered an automated monitoring system that reduces system downtime awareness from hours to seconds via real-time admin alerts.
 
 ## System Architecture
 
-Initially built as a monolith, I refactored the system into a decoupled microservice architecture. This separation of concerns ensures scalability, making it easy to add a web dashboard or mobile app in the future without touching the AI/DB logic.
+Initially built as a monolith, I refactored the system into a decoupled microservice architecture. This separation of concerns ensures scalability, and the built-in monitoring loop guarantees high availability.
 
 ```text
 ┌─────────────────┐           HTTP POST           ┌───────────────────────┐
@@ -20,45 +20,50 @@ Initially built as a monolith, I refactored the system into a decoupled microser
 │ Telegram Client │ ────────────────────────────> │    FastAPI Backend    │
 │  (Presentation) │ <──────────────────────────── │    (Core Business     │
 │                 │         JSON Response         │        Logic)         │
-└─────────────────┘                               └──────────┬────────────┘
-                                                             │
-                                   ┌─────────────────────────┼─────────────────────────┐
-                                   │                         │                         │
-                                   ▼                         ▼                         ▼
-                        ┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
-                        │    Google GenAI   │     │ SQLite Database   │     │ Distributed       │
-                        │    (NLP Engine)   │     │ (Persistence)     │     │ Logging (bot.log) │
-                        └───────────────────┘     └───────────────────┘     └───────────────────┘
-
+└───────┬─────────┘                               └──────────┬────────────┘
+        │                                                    │
+        │             ┌─────────────────────────┐            │
+        │             │   Automated Monitor     │            │
+        └────────────>│  (Pings /health every   │<───────────┘
+     Alerts Admin if  │       5 minutes)        │
+       Server Down    └─────────────────────────┘
+                                   │
+                                   ▼
+                        ┌───────────────────┐     ┌───────────────────┐ 
+                        │    Google GenAI   │     │ SQLite Database   │ 
+                        │  (Data Parsing)   │     │  (Persistence)    │ 
+                        └───────────────────┘     └───────────────────┘
 ```
 ## Challenges, Trade-offs & What I Learned
- 
-- **The LLM Reliability Problem: AI models are non-deterministic. Initially, Gemini would occasionally return invalid JSON or timeout. Trade-off/Fix: Instead of trusting the output blindly, I implemented prompt guardrails, strict JSON parsing validation, and a retry mechanism.
 
-- **The Observability Gap: When I decoupled the system into two services, debugging became difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
+- ** The Verification Bottleneck & Safety Guardrails: AI models are non-deterministic and can hallucinate invalid JSON structures. Fix: I did not trust the AI output blindly. I implemented strict prompt engineering guardrails and a comprehensive pytest suite. This acts as a safety net to verify the AI's output format before it ever touches the database.
+Production Monitoring: Decoupling the system created a visibility gap; if the API went down, the bot would silently fail. Fix: I built an automated background task in the Telegram client that pings the FastAPI /health endpoint every 5 minutes. If it fails, it instantly sends an emergency Telegram alert to the admin, shifting the system from reactive to proactive monitoring.
 
-- **Git Version Control for Data: I quickly learned that tracking live production data files on Git causes merge conflicts during deployments. Fix: Added .db and .jsonl to .gitignore and utilized git stash workflows during production pulls.
+- ** Distributed Observability: Tracking errors across two microservices was difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
 
-## Tech Stack
+##Tech Stack 
 Backend: Python 3.12, FastAPI, Uvicorn
-Client: python-telegram-bot, Requests
+
+Client: python-telegram-bot, Requests, Asyncio (for background monitoring)
+
 AI/NLP: Google GenAI SDK
+
 Data & State: SQLite3
-Testing/CI: Pytest (Configured for core logic validation)
 
-🔧 Configuration
-The project uses .gitignore to keep credentials (.env) and state data out of version control. Create a .env file in the root directory by copying the example file:
+Testing/CI: Pytest (Configured for core logic validation and health checks)
+
+## Configuration
+The project uses .gitignore to keep credentials (.env) and state data out of version control. Create a .env file in the root directory:
 cp .env.example .env
-Note: Your .env should include GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, and ORDER_API_URL=http://127.0.0.1:8001/process-order.
+Note: Your .env should include GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID (for health alerts), and ORDER_API_URL=http://127.0.0.1:8001/process-order.
 
-📖 Usage
+## Usage
 1. Start the Backend API Install dependencies and run the FastAPI server:
 pip install -r requirements.txt
 uvicorn api:app --port 8001
-(The API will run locally on http://127.0.0.1:8001)
-2. Start the Telegram Client In a separate terminal tab, start the bot listener:
+2. Start the Telegram Client (with Active Monitor) In a separate terminal tab, start the bot listener. This will automatically spin up the 5-minute background health-check loop:
 python telegram_bot.py
 
-🧪 Testing
+## Testing (The Safety Net)
 Run the test suite to verify data parsing, API mocking, and the /health endpoint:
 pytest __tests__/
