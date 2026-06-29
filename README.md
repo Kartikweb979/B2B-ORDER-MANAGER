@@ -36,10 +36,10 @@ Initially built as a monolith, I refactored the system into a decoupled microser
 ```
 ## Challenges, Trade-offs & What I Learned
 
-- ** The Verification Bottleneck & Safety Guardrails: AI models are non-deterministic and can hallucinate invalid JSON structures. Fix: I did not trust the AI output blindly. I implemented strict prompt engineering guardrails and a comprehensive pytest suite. This acts as a safety net to verify the AI's output format before it ever touches the database.
+-  The Verification Bottleneck & Safety Guardrails: AI models are non-deterministic and can hallucinate invalid JSON structures. Fix: I did not trust the AI output blindly. I implemented strict prompt engineering guardrails and a comprehensive pytest suite. This acts as a safety net to verify the AI's output format before it ever touches the database.
 Production Monitoring: Decoupling the system created a visibility gap; if the API went down, the bot would silently fail. Fix: I built an automated background task in the Telegram client that pings the FastAPI /health endpoint every 5 minutes. If it fails, it instantly sends an emergency Telegram alert to the admin, shifting the system from reactive to proactive monitoring.
 
-- ** Distributed Observability: Tracking errors across two microservices was difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
+-  Distributed Observability: Tracking errors across two microservices was difficult. Fix: I implemented centralized, production-grade logging (bot.log) across both the Telegram client and the FastAPI server to trace HTTP statuses, API timeouts, and database locks.
 
 ##Tech Stack 
 Backend: Python 3.12, FastAPI, Uvicorn
